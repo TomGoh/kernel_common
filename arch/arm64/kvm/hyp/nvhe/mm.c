@@ -92,19 +92,38 @@ static int __pkvm_create_mappings(unsigned long start, unsigned long size,
 	return err;
 }
 
+/*
+ * 实际的进行虚拟内存的分配，使用的是简单的线性分配器，每次分配后递增__io_map_base
+ * 确保不会与__hyp_vmemmap冲突
+ * 
+ *   VA空间布局：
+  Hypervisor VA Space:
+  ├── 0x0 - 恒等映射区域 (idmap)
+  ├── ...
+  ├── __io_map_base - 私有映射起始
+  │   ├── 分配区域1
+  │   ├── 分配区域2
+  │   └── ...
+  ├── ...
+  └── __hyp_vmemmap - vmemmap区域
+*/
 static int __pkvm_alloc_private_va_range(unsigned long start, size_t size)
 {
 	unsigned long cur;
 
+	// 肯定在分配前需要拥有锁进行独占
 	hyp_assert_lock_held(&pkvm_pgd_lock);
 
+	// 检查虚地址的起始地址，低于当前VA基址则不予分配
 	if (!start || start < __io_map_base)
 		return -EINVAL;
 
 	/* The allocated size is always a multiple of PAGE_SIZE */
+	// 页对齐的分配，将当前 VA 的基址顺移当前分配的地址段末尾之后
 	cur = start + PAGE_ALIGN(size);
 
 	/* Are we overflowing on the vmemmap ? */
+	// 如果与VA地址段之上的 vmemap区域重合了证明内存不够了，报错退出
 	if (cur > __hyp_vmemmap)
 		return -ENOMEM;
 
@@ -129,7 +148,9 @@ int pkvm_alloc_private_va_range(size_t size, unsigned long *haddr)
 	int ret;
 
 	hyp_spin_lock(&pkvm_pgd_lock);
+	// 利用Hypervisor私有VA空间的当前分配位置的地址
 	addr = __io_map_base;
+	// 检查分配的地址是否与其他部分重合并分配
 	ret = __pkvm_alloc_private_va_range(addr, size);
 	hyp_spin_unlock(&pkvm_pgd_lock);
 
@@ -138,6 +159,20 @@ int pkvm_alloc_private_va_range(size_t size, unsigned long *haddr)
 	return ret;
 }
 
+/*
+ * 为指定的物理地址创建Hypervisor私有虚拟地址映射
+ * 也就是讲一个物理地址转化为仅仅对 hypervisor 可见的虚拟地址的映射过程
+ * 
+ * 参数：
+ *  - phys：需要创建 Hypervisor 私有虚拟地址映射的物理地址
+ *  - size：需要创建映射的区域大小
+ *  - prot：创建的映射的访问权限参数
+ *  - haddr：映射完成后的最终的虚拟地址，使用指针返回
+ * 
+ * 返回值：
+ *  -err： 如果出错就返回错误
+ * 最终的映射完成的虚拟地址通过参数 hadrr 指针返回
+*/
 int __pkvm_create_private_mapping(phys_addr_t phys, size_t size,
 				  enum kvm_pgtable_prot prot,
 				  unsigned long *haddr)
@@ -145,15 +180,31 @@ int __pkvm_create_private_mapping(phys_addr_t phys, size_t size,
 	unsigned long addr;
 	int err;
 
+	/* 首先进页对齐后计算实际需要映射的大小
+	 * 其实就是把需要映射的内存空间的大小调整到页面大小的整数倍
+	 *
+	 * 步骤：
+	 * - offset_in_page(phys)：获取物理地址在页面内的偏移量
+	 * - size + offset_in_page(phys)：原始大小 + 页内偏移
+	 * - PAGE_ALIGN()：向上对齐到页面边界
+	 */
 	size = PAGE_ALIGN(size + offset_in_page(phys));
+
+	// 针对这个对齐之后的内存空间进行虚拟地址的分配
+	// 分配的虚拟地址空间在 io_map_base 地址所在的 io_map 私有映射段
 	err = pkvm_alloc_private_va_range(size, &addr);
 	if (err)
 		return err;
 
+	// 分配完虚拟地址之后，就得建立物理地址和虚拟地址之间的映射了、
+	// 也就是更新 hypervisor 自己的 pkvm_pgtable 页表
 	err = __pkvm_create_mappings(addr, size, phys, prot);
 	if (err)
 		return err;
 
+	// 物理地址与虚拟地址的映射建立完成后，计算并返回最终的虚拟地址
+	// 这个最终的虚拟地址就是：
+	// 页对齐后的虚拟地址基址 + 原始物理地址在页内的偏移量
 	*haddr = addr + offset_in_page(phys);
 	return err;
 }
@@ -273,32 +324,80 @@ void pkvm_remove_mappings(void *from, void *to)
 	hyp_spin_unlock(&pkvm_pgd_lock);
 }
 
+/*
+ * 为 Hypervisor 的 vmemmap 区域创建物理内存支撑
+ * 
+ * vmemmap 区域的作用：
+ * vmemmap 是一个虚拟地址区域，用于存储每个物理页面对应的 struct hyp_page 数据结构
+ * 它为 Hypervisor 管理的每个物理页面提供元数据存储空间
+ * 
+ * 设计原理：
+ * 1. 对于每个物理页面 P，都有一个对应的 struct hyp_page 结构
+ * 2. 这个结构存储在 vmemmap 区域中的固定位置
+ * 3. 通过 hyp_phys_to_page(phys) = &hyp_vmemmap[phys >> PAGE_SHIFT] 可以快速找到页面元数据
+ * 
+ * 内存布局示例：
+ * 假设物理内存从 0x40000000 开始，有 1GB 内存:
+ * 
+ * 物理内存:        0x40000000 - 0x80000000 (1GB, 256K个页面)
+ * vmemmap VA:      0x3000000000 - 0x3000400000 (256K * sizeof(struct hyp_page))
+ * vmemmap 物理支撑: back 参数指向的连续物理页面
+ * 
+ * 参数：
+ *  - back：用于支撑 vmemmap 虚拟地址的物理内存起始地址
+ * 
+ * 返回值：
+ *  - 0: 成功
+ *  - 负数: 失败错误码
+ */
 int hyp_back_vmemmap(phys_addr_t back)
 {
 	unsigned long i, start, size, end = 0;
 	int ret;
 
+	// 遍历 Hypervisor 管理的所有内存块，为每个内存块对应的页面元数据创建映射
 	for (i = 0; i < hyp_memblock_nr; i++) {
+		// 计算当前内存块的起始物理地址
 		start = hyp_memory[i].base;
+		// 将物理地址转换为对应的 struct hyp_page 在 vmemmap 中的虚拟地址
+		// hyp_phys_to_page(start) 计算出该物理页面对应的 struct hyp_page* 指针
+		// 然后转换为虚拟地址并页对齐
 		start = ALIGN_DOWN((u64)hyp_phys_to_page(start), PAGE_SIZE);
+		
 		/*
-		 * The begining of the hyp_vmemmap region for the current
-		 * memblock may already be backed by the page backing the end
-		 * the previous region, so avoid mapping it twice.
+		 * 当前内存块的 vmemmap 区域起始位置可能与上一个内存块的
+		 * vmemmap 区域的结束位置有重叠，避免重复映射
+		 * 
+		 * 例如：
+		 * Memory Block 1: [0x40000000, 0x40001000) -> vmemmap [VA1, VA1+32)
+		 * Memory Block 2: [0x40001000, 0x40002000) -> vmemmap [VA1+32, VA1+64)
+		 * 如果第二个块的起始 VA 小于第一个块的结束 VA，就需要调整
 		 */
 		start = max(start, end);
 
+		// 计算当前内存块的结束位置对应的 vmemmap 虚拟地址
 		end = hyp_memory[i].base + hyp_memory[i].size;
 		end = PAGE_ALIGN((u64)hyp_phys_to_page(end));
+		
+		// 如果计算出的范围无效，跳过这个内存块
 		if (start >= end)
 			continue;
 
+		// 计算需要映射的 vmemmap 区域大小
 		size = end - start;
+		
+		// 在 Hypervisor 页表中创建 vmemmap 虚拟地址到物理地址的映射
+		// start: vmemmap 虚拟地址
+		// size:  vmemmap 区域大小  
+		// back:  支撑 vmemmap 的物理内存地址
+		// PAGE_HYP: Hypervisor 页面访问权限
 		ret = __pkvm_create_mappings(start, size, back, PAGE_HYP);
 		if (ret)
 			return ret;
 
+		// 清零新映射的 vmemmap 区域，确保所有 struct hyp_page 初始状态为 0
 		memset(hyp_phys_to_virt(back), 0, size);
+		// 移动到下一个用于支撑 vmemmap 的物理页面
 		back += size;
 	}
 

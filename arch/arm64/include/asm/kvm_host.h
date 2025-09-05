@@ -103,34 +103,113 @@ struct kvm_hyp_memcache {
 	unsigned long flags;
 };
 
+/*
+ * Memcache 的设计
+ * 
+ * Memcache 本身是一个由若干内存页面块构成的链表
+ * 但与传统的、依赖独立链表数据结构的链表不同，
+ * Memcache 的链表是基于页面的物理地址进行连接的
+ * 
+ * 每个页面块中可能由若干内存页面，但需要满足阶数的要求
+ * 也就是说每个页面块中只能有 2^n 个页面
+ * 
+ * 在Memcache 中的每一个页面块的第一个 4KB 的页面中，前 8 位都存储了指向这个
+ * 链表中当前页面节点的下一个页面节点的物理地址，剩余的空间则未使用。
+ * 
+ *   memcache
+    ┌───────┐
+   │head=PA+order │──→ 页面块1的首个页面 (4KB)
+  │ nr_pages=3   │    ┌────────┐
+ │ flags = 0    │    │ [0:7]=PA2+order│──→ 页面块2的首个页面 (4KB)
+└───────┘    │ [8:4095] = ... │   ┌────────┐
+                     └────────┘   │ [0:7]=PA3+order│──→ 页面块3的首个页面 (4KB)
+                                           │ [8:4095] = ... │   ┌────────┐
+                                          └────────┘   │ [0:7]=0+order  │
+                                                                │ [8:4095] = ... │
+                                                               └────────┘
+ * 
+ * 而在使用过程中， memcache  更像一个栈，需要获取新的页面时
+ * 总是从其头部开始获取页面；
+ * 需要补充插入页面时也总是采用链表的头插法
+ */
+
+/*
+ * Memcache 头插法入栈新的页面块
+ * 
+ * 参数：
+ *  - mc： 目标 memcache
+ *  - p：要加入的新页面块的首个页面的虚拟地址指针
+ *  - to_pa：需要采用的将虚拟地址转化为物理地址的函数的指针
+ *  - order：插入的新页面块的阶数
+ */
 static inline void push_hyp_memcache(struct kvm_hyp_memcache *mc,
 				     phys_addr_t *p,
 				     phys_addr_t (*to_pa)(void *virt),
 				     unsigned long order)
 {
+	// 将当前链表头的值写入新页面的前8字节，这样新页面就"记住"了原来的链表头
 	*p = mc->head;
+	/*
+	 * 步骤1：to_pa(p) - 获取新页面的物理地址
+	 * 步骤2：& PAGE_MASK - 清除低12位，确保页面对齐
+	 * 步骤3：FIELD_PREP(~PAGE_MASK, order) - 将order编码到低12位
+	 * 步骤4：| - 合并地址和order，更新head
+	 */
 	mc->head = (to_pa(p) & PAGE_MASK) |
 		   FIELD_PREP(~PAGE_MASK, order);
+	// 页面计数器增加
 	mc->nr_pages++;
 }
 
+/*
+ * Memcache 出栈页面快
+ * 
+ * 参数： 
+ *  - mc：目标 memcache
+ *  - to_pa：需要采用的将虚拟地址转化为物理地址的函数的指针
+ *  - order：输出参数，返回弹出页面的阶数，以指针的形式传入
+*/
 static inline void *pop_hyp_memcache(struct kvm_hyp_memcache *mc,
 				     void *(*to_va)(phys_addr_t phys),
 				     unsigned long *order)
 {
+	// 步骤1：mc->head & PAGE_MASK - 提取当前头节点的物理地址
+    // 步骤2：to_va() - 转换为虚拟地址
+    // 步骤3：(phys_addr_t *) - 将页面开头8字节视为指针
 	phys_addr_t *p = to_va(mc->head & PAGE_MASK);
 
+	// 页面不够了？失败
 	if (!mc->nr_pages)
 		return NULL;
 
+	// 从 head 中提取 order 阶数
 	*order = FIELD_GET(~PAGE_MASK, mc->head);
 
+	// 更新链表数据，将当前页面的前 8 位，也就是下一个页面节点的地址和阶数
+	//  作为新的链表头
 	mc->head = *p;
+	// 页面计数器也减少
 	mc->nr_pages--;
 
+	// 返回弹出页面的虚拟地址
 	return p;
 }
 
+/*
+ * Memcache 的批量补充函数，一个更加通用的补充机制
+ *
+ * 会使用传入的分配函数进行实际内存分配，而在数据结构层面
+ * 则会调用 push_hyp_memcache 函数针对每一个分割出来的页面块
+ * 进行 memcache 的头插入栈
+ * 
+ * 参数：
+ *  - mc： 目标 memcache
+ *  - min_pages：最少需要补充的页面数量
+ *  - alloc_fn：分配函数指针，用于实际分配内存，比如 admit_host_page
+ *  - to_pa: 虚拟地址转物理地址的转换函数
+ *  - arg: 传递给alloc_fn的参数(通常是source memcache)
+ *  - order: 每次分配的页面阶数(2^order个页面为一块)
+*/
 static inline int __topup_hyp_memcache(struct kvm_hyp_memcache *mc,
 				       unsigned long min_pages,
 				       void *(*alloc_fn)(void *arg, unsigned long order),
@@ -138,17 +217,21 @@ static inline int __topup_hyp_memcache(struct kvm_hyp_memcache *mc,
 				       void *arg,
 				       unsigned long order)
 {
+	// 循环补充，直到页面数达到min_pages
 	while (mc->nr_pages < min_pages) {
+		// 调用分配函数获取页面块的物理地址
 		phys_addr_t *p = alloc_fn(arg, order);
 
 		if (!p)
 			return -ENOMEM;
+		// 将新分配的页面块加入 memcache
 		push_hyp_memcache(mc, p, to_pa, order);
 	}
 
 	return 0;
 }
 
+// 清空memcache，将所有页面块释放回指定的内存管理器
 static inline void __free_hyp_memcache(struct kvm_hyp_memcache *mc,
 				       void (*free_fn)(void *virt, void *arg, unsigned long order),
 				       void *(*to_va)(phys_addr_t phys),
@@ -157,6 +240,8 @@ static inline void __free_hyp_memcache(struct kvm_hyp_memcache *mc,
 	unsigned long order;
 	void *p;
 
+	// 循环调用 pop_hyp_memcache() 从链表中取出页面块
+	// 对每个页面块调用free_fn进行释放
 	while (mc->nr_pages) {
 		p = pop_hyp_memcache(mc, to_va, &order);
 		free_fn(p, arg, order);
