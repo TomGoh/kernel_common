@@ -56,11 +56,17 @@ enum memblock_flags {
  * @flags: memory region attributes
  * @nid: NUMA node id
  */
+
+// 描述物理内存区域的数据结构
 struct memblock_region {
+	// 物理基地址，也就是内存区域的起始地址
 	phys_addr_t base;
+	// 该内存区域的大小，单位是字节
 	phys_addr_t size;
+	// 内存区域属性标志，标记内存类型和属性
 	enum memblock_flags flags;
 #ifdef CONFIG_NUMA
+	// 仅限 NUMA 系统，标记 NUMA 节点 ID
 	int nid;
 #endif
 };

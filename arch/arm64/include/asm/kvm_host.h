@@ -83,9 +83,23 @@ int kvm_reset_vcpu(struct kvm_vcpu *vcpu);
 void kvm_arm_vcpu_destroy(struct kvm_vcpu *vcpu);
 
 /* Head holds page head and it's order. */
+/*
+ * memcache 是 pKVM进行内存管理的容器之一
+ * 其中存储了被某一实体拥有的内存页面
+ */
 struct kvm_hyp_memcache {
+	/*
+	 * 存储页面物理地址 和 order 阶数信息的字段
+	 * [63:12] - 物理页面地址 (52位) 
+	 * [11:0]  - order信息 (12位，实际只需要几位)
+	 * 
+	 * 在 64 位架构下，一个 4KB 的页面的地址的低 12 位永远是 0
+	 * 因此可以用来被存储其他信息，在这里被用来存储阶数信息
+	 */
 	phys_addr_t head;
+	// 当前memcache中缓存的页面总数，是 页面数量，不是字节数
 	unsigned long nr_pages;
+	// 标志位
 	unsigned long flags;
 };
 

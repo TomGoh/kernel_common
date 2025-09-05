@@ -458,15 +458,59 @@ static inline bool kvm_pgtable_walk_lock_held(void)
  * @flags:		Stage-2 page-table flags.
  * @pte_ops:		PTE callbacks.
  */
+
+ // 统一管理 Stage-1（虚拟地址转换）和 Stage-2（虚拟化地址转换）两种场景的页表
 struct kvm_pgtable {
+	// 输入地址位数，定义虚拟地址空间的地址使用的位数，如 39 位 对应 512GB 空间
 	u32					ia_bits;
+	/*
+	 * start_level 代表当前页表对应的起始页表级别
+	 * Arm 架构下页表有一些固定的设定：
+	 *  - 页面大小：4KB (2^12)
+	 *  - 每级页表条目数：512个 (2^9)
+	 *  - 每个页表条目：8字节，可以索引9位地址
+	 * 
+	 * 基于这些设定，可以将 Arm AArch64 下的页表分为 4 个层级：
+	 *   Level 0: 索引位 [47:39] → 每个条目覆盖 2^39 = 512GB
+     *   Level 1: 索引位 [38:30] → 每个条目覆盖 2^30 = 1GB
+     *   Level 2: 索引位 [29:21] → 每个条目覆盖 2^21 = 2MB
+     *   Level 3: 索引位 [20:12] → 每个条目覆盖 2^12 = 4KB
+     *   页内偏移:      [11:0]  → 4KB页面内的字节偏移
+	 * 
+	 * 因此，根据 ia_bits 地址长度 不同数值，需要相应的不同层级的页表结构：
+	 * 
+	 * 48位地址空间 (256TB):
+     * 虚拟地址: [47:39][38:30][29:21][20:12][11:0]
+  	 * 页表层级: Level0→Level1→Level2→Level3
+     * start_level = 0 (需要4级页表)
+	 *
+  	 * 39位地址空间 (512GB):
+  	 * 虚拟地址: [38:30][29:21][20:12][11:0]
+  	 * 页表层级: Level1→Level2→Level3
+  	 * start_level = 1 (需要3级页表，跳过Level0)
+     *
+	 * 30位地址空间 (1GB):
+	 * 虚拟地址: [29:21][20:12][11:0]
+	 * 页表层级: Level2→Level3
+	 * start_level = 2 (需要2级页表，跳过Level0和Level1)
+	 * 
+	 * 总的来说就是：
+	 * levels_needed = (ia_bits - 12 + 8) / 9;
+     * start_level = 4 - levels_needed;
+	 */
 	u32					start_level;
+	// 页全局目录指针，指向页表的根目录（Page Global Directory），是整个页表树的入口点
 	kvm_pteref_t				pgd;
+	// 内存管理操作函数集，包含页面分配、释放、缓存操作等函数指针，抽象化内存管理操作
 	struct kvm_pgtable_mm_ops		*mm_ops;
 
 	/* Stage-2 only */
+	// 虚拟化场景 Stage-2 专用字段
+	// Stage-2 内存管理单元，指向 Stage-2 MMU 结构，用于客户机物理地址（GPA）到主机物理地址（PA）的转换
 	struct kvm_s2_mmu			*mmu;
+	// Stage-2 页表标志位，控制 Stage-2 页表行为的标志，如是否启用某些特性
 	enum kvm_pgtable_stage2_flags		flags;
+	// 表项操作函数集，定义如何操作页表项的函数指针，处理页表项的读写和属性设置
 	struct kvm_pgtable_pte_ops		*pte_ops;
 };
 

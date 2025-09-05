@@ -1027,12 +1027,15 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	struct kvm_run *run = vcpu->run;
 	int ret;
 
+	// 如果之前已经被运行过，判断退出原因是不是因为 MMIO
+	// 如果是的话，处理 MMIO
 	if (run->exit_reason == KVM_EXIT_MMIO) {
 		ret = kvm_handle_mmio_return(vcpu);
 		if (ret)
 			return ret;
 	}
 
+	// 加载 vcpu， 涉及到 hypercall
 	vcpu_load(vcpu);
 
 	if (run->immediate_exit) {
@@ -1048,8 +1051,14 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	while (ret > 0) {
 		/*
 		 * Check conditions before entering the guest
+		 * 主要是检查是否有等待处理的信号，如果有的话返回的 ret 是负数（-4）
+		 * 对于其他待处理工作，如调度需求和用户模式恢复工作，则直接处理，完成后返回 0
 		 */
 		ret = xfer_to_guest_mode_handle_work(vcpu);
+
+		// 如果上一步的待处理工作被处理完成，则设置 ret 为 1
+		// 针对有信号没有处理的情况，ret 仍为 -4，会在之后的
+		
 		if (!ret)
 			ret = 1;
 

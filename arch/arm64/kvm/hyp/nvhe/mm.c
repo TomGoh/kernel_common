@@ -19,28 +19,74 @@
 #include <nvhe/modules.h>
 #include <nvhe/spinlock.h>
 
+/*
+ * Hypervisor 自己的页表，用于管理 Hypervisor 在 EL2 的虚拟地址空间
+ * 包括：
+ *  - 管理 Hypervisor 代码，数据和栈的虚拟地址映射
+ *  - 处理 Hypervisor 内部虚拟地址到物理地址的转换
+ * 通过这个页表 Hypervisor 能够控制自己可以访问哪些物理内存，
+ * 确保 Hypervisor 内存与 Host Kernel 和 Guest pVM 的内存完全隔离
+ *
+ * 注意： 这个页表不负责 Host 与 Guest pVM 的页表转换，仅仅是 Hypervisor 自用
+*/
 struct kvm_pgtable pkvm_pgtable;
 hyp_spinlock_t pkvm_pgd_lock;
 
+// 使用定义在 /include/linux/memblock.h 中的 memblock_region
+// 记录 Hypervisor 被分配的内存区域，内存隔离的物理基础
 struct memblock_region hyp_memory[HYP_MEMBLOCK_REGIONS];
+// 使用一个无符号数记录 hypervisor 实际使用的区域数量
 unsigned int hyp_memblock_nr;
 
+// Hypervisor 私有虚拟地址分配的基地址指针，
+// 用于跟踪hypervisor私有VA空间的分配位置, 随着新的私有映射创建而动态增长
+// 确保私有VA分配不会重叠
+// 在 hyp_create_idmap() 中初始化其值 
+// 在 pkvm_alloc_private_va_range() 中作为分配起点
 static u64 __io_map_base;
 
+/*
+ * 临时映射槽位结构，用于hypervisor的临时页面映射
+ * 为hypervisor提供临时的、可动态修改的页面映射，无需分配新的页表页
+ * 
+ * 使用示例：
+ *   // 临时映射一个物理页面进行访问
+ *   void *ptr = hyp_fixmap_map(phys_addr);
+ *   // 使用ptr访问该物理页面
+ *   // 完成后解除映射
+ *   hyp_fixmap_unmap();
+ */
 struct hyp_fixmap_slot {
+	// 该 fixmap槽对应的虚拟地址
 	u64 addr;
+	// 页表项指针，指向该虚拟地址对应的页表项，用于快速修改映射
 	kvm_pte_t *ptep;
+	// 页表层级，用于标注该页表项所在的层级
 	u8 level;
 };
 static DEFINE_PER_CPU(struct hyp_fixmap_slot, fixmap_slots);
 
+/*
+ * pKVM的核心映射函数，负责在 hypervisor 页表 pkvm_pgtable 中创建虚拟地址到物理地址的映射
+ * 
+ * 函数参数：
+ * - start：虚拟地址起始位置
+ * - size: 映射区域大小
+ * - phys: 物理地址起始位置
+ * - prot: 页面保护属性（可读/可写/可执行等）
+ * 
+ * 返回值： 映射结果(0=成功，负数=错误)
+ */
 static int __pkvm_create_mappings(unsigned long start, unsigned long size,
 				  unsigned long phys, enum kvm_pgtable_prot prot)
 {
 	int err;
 
+	// 保护pkvm_pgtable页表的并发访问
 	hyp_spin_lock(&pkvm_pgd_lock);
+	// 实际的页表映射操作，所有参数直接传给底层API kvm_pgtable_hyp_map
 	err = kvm_pgtable_hyp_map(&pkvm_pgtable, start, size, phys, prot);
+	// 释放锁
 	hyp_spin_unlock(&pkvm_pgd_lock);
 
 	return err;
@@ -475,13 +521,30 @@ int hyp_create_fixmap(void)
 	return create_fixblock();
 }
 
+/*
+ * 为 Hypervisor 创建恒等映射（iddentical mapping），同时初始化虚拟地址空间布局，
+ * 为IO映射和vmemmap预留独立空间，确保不同用途的VA区域不会重叠
+ * 划分完成后调用 __pkvm_create_mappings 创建恒等映射
+ * 
+ * 在 __pkvm_init 中通过 recreate_hyp_mappings 被调用
+ * 
+ * 输入参数:
+ *  - `hyp_va_bits`： Hypervisor 虚拟地址的位数，一般为 39 或 48 位
+ * 
+ * 返回值：
+ *  - 调用 `__pkvm_create_mappings` 进行映射创建的具体结果
+ */
 int hyp_create_idmap(u32 hyp_va_bits)
 {
 	unsigned long start, end;
-
+	
+	// 计算恒等映射需要的范围，包括起始地址，结束地址
+	// 起始地址来自于链接时 vmlinux.lds.S 的定义
 	start = hyp_virt_to_phys((void *)__hyp_idmap_text_start);
+	// 页对齐
 	start = ALIGN_DOWN(start, PAGE_SIZE);
 
+	// 终止位置一样来自与链接文件的定义
 	end = hyp_virt_to_phys((void *)__hyp_idmap_text_end);
 	end = ALIGN(end, PAGE_SIZE);
 
@@ -493,9 +556,54 @@ int hyp_create_idmap(u32 hyp_va_bits)
 	 * with the idmap to place the IOs and the vmemmap. IOs use the lower
 	 * half of the quarter and the vmemmap the upper half.
 	 */
+
+	/*
+	 * 取start地址的 hyp_va_bits - 2 位
+	 * 
+	 * BIT(hyp_va_bits - 2) = 第(hyp_va_bits-2)位设为1
+	 * BIT 生成一个特定位的掩码，通过将数字 1 左移指定的位数 (nr) 
+	 * 以39位为例：BIT(37) = 0x2000000000 (第37位为1)
+	 * start & BIT(37) 提取start地址的第37位
+	 * 结果： 要么是0，要么是0x2000000000，假设为0
+	 */
 	__io_map_base = start & BIT(hyp_va_bits - 2);
+	/* 
+	 * 翻转第 hyp_va_bits - 2 位
+	 * 
+	 * 如果上一步结果是0，异或后变成0x2000000000
+	 * 如果上一步结果是0x2000000000，异或后变成0
+	 * 目的： 确保IO映射区域与idmap不在同一个VA空间半区
+	 */
 	__io_map_base ^= BIT(hyp_va_bits - 2);
+	/*
+	 * 在IO区域基础上设置第(hyp_va_bits-3)位
+	 * 
+	 * BIT(hyp_va_bits - 3) = 第(hyp_va_bits-3)位设为1
+	 * 以39位为例：BIT(36) = 0x1000000000
+	 * __io_map_base | BIT(36) 在IO基地址基础上加上这一位
+	 * __hyp_vmemmap = 0x2000000000 + 0x1000000000 = 0x3000000000
+	 * 结果： vmemmap区域在IO区域的上半部分
+	*/
 	__hyp_vmemmap = __io_map_base | BIT(hyp_va_bits - 3);
+
+	/*
+	 * 
+	 *
+	 *   VA空间分布 (39位 = 512GB)：
+  ┌─────────────────────┐ 0x8000000000 (512GB)
+  │   Linear Mapping       │ ← 上半部分 (256GB)
+  │   (物理内存线性映射)  │
+  ├─────────────────────┤ 0x4000000000 (256GB)
+  │     vmemmap          │ ← 第四象限 (64GB)
+  ├─────────────────────┤ 0x3000000000 (192GB)
+  │   IO Mapping        │ ← 第三象限 (64GB)
+  ├─────────────────────┤ 0x2000000000 (128GB)
+  │    idmap/其他      │ ← 第二象限 (128GB)
+  ├─────────────────────┤
+  │      预留区        │ ← 第一象限
+  └─────────────────────┘ 0x0000000000
+	 *
+   	 */
 
 	return __pkvm_create_mappings(start, end - start, start, PAGE_HYP_EXEC);
 }
@@ -539,18 +647,37 @@ int pkvm_create_stack(phys_addr_t phys, unsigned long *haddr)
 	return ret;
 }
 
+/*
+ * pKVM 管理的核心桥梁函数，负责将 Host 拥有的物理页面转移给 Hypervisor 使用
+ * 
+ * 参数：
+ *  - arg： 一个指向 struct kvm_hyp_memcache* host_mc 的指针，是 Host 提供的内存缓存
+ *  - order: 页面分配的阶数，和 Linux 的批量分配连续物理页面机制相关。简而言之直接对应需要的页面数量：
+ * 			页面数量= 2 ^ （阶数），这在页面大小确定的情况下也间接指定了需要的内存的大小。
+ * 
+ * 返回值：
+ * 	- 成功则返回转移的页面在 hypervisor 内对应的虚拟地址，失败则返回 NULL。
+ */
 static void *admit_host_page(void *arg, unsigned long order)
 {
 	phys_addr_t p;
 	struct kvm_hyp_memcache *host_mc = arg;
 	unsigned long mc_order;
 
+	// 首先使用 Host 的 memcache 验证是否还有页面可用，没有就返回 NULL
 	if (!host_mc->nr_pages)
 		return NULL;
 
+	// Host 的 memcache 中的 head部分同时编码了：
+	// - memcache 中管理的阶数大小
+	// - memcache 对应的页面物理地址
+	// 首先从 Host 的 memcache 中提取其阶数信息
 	mc_order = FIELD_GET(~PAGE_MASK, host_mc->head);
+	// 如果 Host 的 memcache 阶数和所要求的的阶数不一致则失败，这是因为：
+	// 阶数实质上是 host memcache 进行页面管理的单位，若是不匹配则无法精准确定
+	// 被转移的页面区块，memcache 管理的都是固定大小的块
 	BUG_ON(order != mc_order);
-
+	// 获得页面物理地址
 	p = host_mc->head & PAGE_MASK;
 	/*
 	 * The host still owns the pages in its memcache, so we need to go
@@ -558,9 +685,18 @@ static void *admit_host_page(void *arg, unsigned long order)
 	 * __pkvm_host_donate_hyp() takes care of races for us, so if it
 	 * succeeds we're good to go.
 	 */
+	/*
+	 * 检查完基础信息过后，进行从 Host memcache 到 Hypervisor 的所有权转移
+	 * 1 << order 指定了需要的页面的个数
+	 * 转移完成后 host 不再拥有这部分页面的所有权
+	 */
 	if (__pkvm_host_donate_hyp(hyp_phys_to_pfn(p), 1 << order))
 		return NULL;
-
+	/*
+	 * 由于进行了从 Host 到 hypervisor 的页面转移，因此需要更新 Host 的 memcache，
+	 * 从 Host 的memcache 中移除对应的页面，返回这些转移到 Hypervisor 名下的页面
+	 * 在Hypervisor 地址空间中的虚拟地址
+	 */
 	return pop_hyp_memcache(host_mc, hyp_phys_to_virt, &order);
 }
 
