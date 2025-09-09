@@ -987,6 +987,13 @@ out:
 
 static void handle___pkvm_host_map_guest(struct kvm_cpu_context *host_ctxt)
 {
+	/**
+	 * 从寄存器提取发起 Hypercall 时传递的参数
+	 * pfn: 主机物理页帧号
+	 * gfn: 客户机物理页帧号
+	 * nr_pages: 要映射的页数
+	 * prot: 映射的内存保护属性
+	 */
 	DECLARE_REG(u64, pfn, host_ctxt, 1);
 	DECLARE_REG(u64, gfn, host_ctxt, 2);
 	DECLARE_REG(u64, nr_pages, host_ctxt, 3);
@@ -1001,14 +1008,29 @@ static void handle___pkvm_host_map_guest(struct kvm_cpu_context *host_ctxt)
 	if (!hyp_vcpu)
 		goto out;
 
-	/* Top-up our per-vcpu memcache from the host's */
+	/**
+	 * 内存缓存的转移
+	 * 将发起 Hypercall 的 pkvm_mem_abort 函数中分配给 Hypervisor
+	 * 在 EL1 异常级别下的 memcache 中的内存页
+	 * 转移到 Hypervisor 在 EL2 异常级别下的 memcache 缓存中
+	 * 这部分缓存页将在从 Host 到 Guest 的内存捐献/共享过程中
+	 * 被用于新建页表页的内存来源
+	 */
 	ret = pkvm_refill_memcache(hyp_vcpu);
 	if (ret)
 		goto out;
 
 	if (pkvm_hyp_vcpu_is_protected(hyp_vcpu))
+		/**
+		 * 针对受保护的虚拟机
+		 * 使用 donate 捐献
+		 */
 		ret = __pkvm_host_donate_guest(hyp_vcpu, pfn, gfn, nr_pages);
 	else
+		/**
+		 * 针对非受保护的虚拟机
+		 * 使用 share 共享
+		 */
 		ret = __pkvm_host_share_guest(hyp_vcpu, pfn, gfn, nr_pages, prot);
 out:
 	cpu_reg(host_ctxt, 1) =  ret;

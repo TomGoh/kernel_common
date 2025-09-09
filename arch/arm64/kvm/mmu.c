@@ -1664,63 +1664,184 @@ static int pkvm_relax_perms(struct kvm_vcpu *vcpu, u64 pfn, u64 gfn, u8 order,
 					(void *)prot, false);
 }
 
+/**
+ * 这个函数是pKVM模式下内存异常处理的核心，其处理逻辑可以概括为以下几个关键步骤：
+ *
+ * 1. 资源准备阶段
+ *
+ * - Hypervisor内存缓存补充: 确保有足够页面用于页表操作
+ * - 固定页面结构分配: 创建kvm_pinned_page用于跟踪锁定状态
+ * - 统计更新: 记录受保护内存使用情况
+ *
+ * 2. 页面获取和锁定阶段
+ *
+ * - 关键操作: 使用pin_user_pages()而非get_user_pages()
+ * - 安全限制: 只接受匿名页面和swap-backed页面，拒绝文件缓存页面
+ * - 错误处理: 处理硬件中毒、获取失败等异常情况
+ *
+ * 3. 页面大小优化阶段
+ *
+ * - 透明大页支持: 尝试使用2MB大页提高性能
+ * - 冲突检测: 检查大页范围内是否存在小页映射冲突
+ * - 降级处理: 如有冲突，降级为4KB小页映射
+ *
+ * 4. 映射建立阶段
+ *
+ * - 核心操作: 调用pkvm_host_map_guest()通过 hypercall 在 EL2 建立IPA→PA直接映射
+ * - 绕过Host MMU: 映射在Hypervisor控制的Stage-2页表中
+ * - 初始权限: 设置为只读，写权限按需添加
+ *
+ * 5. 状态记录和完成阶段
+ *
+ * - 锁定记录: 将页面信息记录到pKVM的maple tree管理结构
+ * - 内存计数: 更新进程锁定内存统计
+ * - 资源清理: 错误路径确保所有资源正确释放
+ * 
+ * 简单来说， pkvm_mem_abort具体实现了：
+ *
+ * 1. 从用户空间(Host)获取一个真实的物理页面
+ * ret = pin_user_pages(hva, 1, flags, &page);
+ *
+ * 2. 锁定这个页面，防止被swap出去
+ * pfn = page_to_pfn(page);
+ *
+ * 3. 通过hypercall告诉EL2："把这个物理页面映射到Guest的IPA地址"
+ * ret = pkvm_host_map_guest(pfn, *fault_ipa >> PAGE_SHIFT,
+ *                           page_size >> PAGE_SHIFT, KVM_PGTABLE_PROT_R);
+ *
+ * 4. 记录这个页面已经被锁定给这个Guest使用
+ * insert_ppage(kvm, ppage);
+ *
+ * 与普通KVM的核心差异
+ *
+ * |  方面   | 普通KVM                | pKVM                |
+ * |---------|-----------------------|---------------------|
+ * | 页面获取 | get_user_pages()      | pin_user_pages()    |
+ * | 页面状态 | 可被换出               | 永久锁定              |
+ * | 页面类型 | 无限制                 | 仅匿名/swap-backed页面|
+ * | 映射管理 | Host内核直接管理Stage-2 | Hypervisor管理Stage-2|
+ * | 地址转换 | IPA→HVA→PA            | IPA→PA（直接映射）    |
+ * | 状态跟踪 | 基本跟踪               | 详细的锁定状态管理     |
+ *
+ * 安全隔离的实现
+ *
+ * 1. 页面锁定: 防止Host内核重新分配或换出受保护VM的物理内存
+ * 2. Hypervisor控制: Stage-2页表完全由可信Hypervisor管理
+ * 3. 类型限制: 避免文件系统相关的安全风险
+ * 4. 直接映射: 绕过Host MMU，消除Host内核的访问路径
+ *
+ * 这种设计确保了即使Host内核被完全攻击，攻击者也无法访问受保护VM的内存内容，实现了强安全隔离。
+ */
 static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 			  struct kvm_memory_slot *memslot, unsigned long hva,
 			  size_t *size)
 {
+	/**
+	 * 定义页锁定标志，用于后续的 pin_user_pages 调用
+	 * - FOLL_HWPOISON: 允许处理硬件中毒页面
+	 * - FOLL_LONGTERM: 页面将长期锁定，阻止页面迁移
+	 * - FOLL_WRITE: 需要写权限
+	 */
 	unsigned int flags = FOLL_HWPOISON | FOLL_LONGTERM | FOLL_WRITE;
+
+	/**
+	 * 获得 Hypervisor 内存缓存，用于分配页表等内存
+	 * 如果缓存中没有足够的页面，topup_hyp_memcache 会尝试进行补充
+	 */
 	struct kvm_hyp_memcache *hyp_memcache = &vcpu->arch.stage2_mc;
+	/**
+	 * 定义后续需要使用的页号，页表偏移量和页面大小变量
+	 */
 	unsigned long index, pmd_offset, page_size;
+	// 获取当前进程的内存描述符
 	struct mm_struct *mm = current->mm;
+	// 分配用于跟踪锁定页面的结构体指针
 	struct kvm_pinned_page *ppage;
 	struct kvm *kvm = vcpu->kvm;
+	// 定义返回值和页面数量变量
 	int ret, nr_pages;
+	// 定义用于 pin_user_pages 的页面指针和页框号变量
 	struct page *page;
 	u64 pfn;
 
+	// 首先记录补充 hypervisor 的 memcache 前的页面数量
 	nr_pages = hyp_memcache->nr_pages;
+	/**
+	 * 确保 Hypervisor 对应的 memcache 中拥有足够的缓存页面
+	 * 这一逻辑主要是通过 topup_hyp_memcache 来实现的
+	 * 其中会使用一个 while 循环，在 memcache 中页面不足传入的要求数量时
+	 * 会持续尝试补充，直到满足要求或者发生错误
+	 */
 	ret = topup_hyp_memcache(hyp_memcache, kvm_mmu_cache_min_pages(kvm), 0);
 	if (ret)
 		return -ENOMEM;
 
+	/**
+	 * 更新补充后的页面数量，并调整 KVM 统计信息
+	 * 这里的逻辑是通过计算补充前后的页面差值来实现，并更新相应的统计计数器
+	 * 分别增加受保护的 Hypervisor 内存和页表内存的统计
+	 * 注意这里的 nr_pages 变量被重新赋值为补充的页面数量
+	 */
 	nr_pages = hyp_memcache->nr_pages - nr_pages;
 	atomic64_add(nr_pages << PAGE_SHIFT, &kvm->stat.protected_hyp_mem);
 	atomic64_add(nr_pages << PAGE_SHIFT, &kvm->stat.protected_pgtable_mem);
 
+	// 分配用于跟踪锁定页面的结构体
 	ppage = kmalloc(sizeof(*ppage), GFP_KERNEL_ACCOUNT);
 	if (!ppage)
 		return -ENOMEM;
 
+	// 获取内存操作的锁
 	mmap_read_lock(mm);
+	/**
+	 * 使用 pin_user_pages 锁定用户空间的页面
+	 * 具体锁定的页面由传入的 hva 地址决定
+	 * 这里传入的 flags 定义了锁定的行为
+	 * - FOLL_HWPOISON: 允许处理硬件中毒页面
+	 * - FOLL_LONGTERM: 页面将长期锁定，阻止页面迁移
+	 * - FOLL_WRITE: 需要写权限
+	 * page 参数用于接收锁定的页面指针
+	 * 注意这里使用 pin_user_pages 而不是 get_user_pages
+	 * 这是因为 pin_user_pages 会将页面永久锁定，防止被 Host 内核换出
+	 * 这对于 pKVM 的安全隔离至关重要
+	 */
 	ret = pin_user_pages(hva, 1, flags, &page);
 	mmap_read_unlock(mm);
 
+	/**
+	 * 如果在锁定页面的过程中发生硬件中毒（内存硬件检测到不可纠正的错误）
+	 * 则向 Host 进程发送硬件中毒信号
+	 * 并将错误码转换为 0，表示处理成功
+	 * 然后跳转到资源释放逻辑
+	 */
 	if (ret == -EHWPOISON) {
 		kvm_send_hwpoison_signal(hva, PAGE_SHIFT);
 		ret = 0;
 		goto free_ppage;
 	} else if (ret != 1) {
+		// 如果锁定页面失败，记录错误码并跳转到资源释放逻辑
 		ret = -EFAULT;
 		goto free_ppage;
 	} else if (kvm->arch.pkvm.enabled && !PageSwapBacked(page)) {
-		/*
-		 * We really can't deal with page-cache pages returned by GUP
-		 * because (a) we may trigger writeback of a page for which we
-		 * no longer have access and (b) page_mkclean() won't find the
-		 * stage-2 mapping in the rmap so we can get out-of-whack with
-		 * the filesystem when marking the page dirty during unpinning
-		 * (see cc5095747edf ("ext4: don't BUG if someone dirty pages
-		 * without asking ext4 first")).
-		 *
-		 * Ideally we'd just restrict ourselves to anonymous pages, but
-		 * we also want to allow memfd (i.e. shmem) pages, so check for
-		 * pages backed by swap in the knowledge that the GUP pin will
-		 * prevent try_to_unmap() from succeeding.
+		/**
+		 * 如果锁定的页面不是匿名页面或 swap-backed 页面
+		 * 则释放锁定的页面，设置错误码为 -EIO，并跳转到资源释放逻辑
+		 * 
+		 * 这是因为：
+		 * 1. 文件缓存页面可能会被 Host 内核回收或重新分配，破坏内存隔离
+		 * 2. pKVM 无法访问文件系统 writeback 机制，无法保证文件缓存页面的持久性
+		 * 3. page_mkclean 无法正确处理缓存页面的 Stage-2 映射，导致文件系统状态不一致
 		 */
 		ret = -EIO;
 		goto unpin;
 	}
 
+	/**
+	 * 进行页面大小调整和透明大页处理
+	 * 尝试将页面调整为 2MB 大小以提高性能
+	 * 这里会调用 transparent_hugepage_adjust 函数
+	 * 更新 pfn 与 fault_ipa 指向大页边界地址
+	 */
 	pfn = page_to_pfn(page);
 	pmd_offset = *fault_ipa & (PMD_SIZE - 1);
 	page_size = transparent_hugepage_adjust(kvm, memslot,
@@ -1732,28 +1853,37 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 		*size = page_size;
 
 retry:
+	// 首先，更新进程的锁定内存统计，防止内存过度锁定
 	ret = account_locked_vm(mm, page_size >> PAGE_SHIFT, true);
 	if (ret)
 		goto unpin;
-
+	// 获取一个针对 KVM MMU 操作的写锁，接下来的操作需要在锁保护下进行
 	write_lock(&kvm->mmu_lock);
-	/*
-	 * If we already have a mapping in the middle of the THP, we have no
-	 * other choice than enforcing PAGE_SIZE for pkvm_host_map_guest() to
-	 * succeed.
+	/**
+	 * 进行大页映射的冲突检查
+	 * 如果在大页范围内发现已有小页映射，则降级为 4KB 小页映射
+	 * 这里通过检查 maple tree 中是否存在冲突的映射来实现
+	 * 如果发现冲突，则释放写锁，更新 fault_ipa 和 pfn 指向下一个 4KB 页边界
+	 * 并调整 page_size 为 4KB，然后跳转到 retry 重新尝试映射
 	 */
 	index = *fault_ipa;
+	// 这里 if 的条件是 page_size 大于 4KB 且 在 maple tree 中查找到已经锁定的页面（冲突）
 	if (page_size > PAGE_SIZE &&
 	    mt_find(&kvm->arch.pkvm.pinned_pages, &index, index + page_size - 1)) {
 		write_unlock(&kvm->mmu_lock);
+		// 调整 fault_ipa 和 pfn 到具体的小页边界
 		*fault_ipa += pmd_offset;
 		pfn += pmd_offset >> PAGE_SHIFT;
+		// 更新页面指针
 		page = pfn_to_page(pfn);
+		// 重置 page_size 为 PAGE_SIZE，i.e.，4KB
 		page_size = PAGE_SIZE;
+		// 取消之前的大页锁定计数，重新以小页计数
 		account_locked_vm(mm, page_size >> PAGE_SHIFT, false);
 		goto retry;
 	}
 
+	// 如果针对锁定的页面没有检测到冲突，则继续进行映射
 	ret = pkvm_host_map_guest(pfn, *fault_ipa >> PAGE_SHIFT,
 				  page_size >> PAGE_SHIFT, KVM_PGTABLE_PROT_R);
 	if (ret) {
@@ -1762,12 +1892,17 @@ retry:
 
 		goto dec_account;
 	}
-
-	ppage->page = page;
-	ppage->ipa = *fault_ipa;
-	ppage->order = get_order(page_size);
-	ppage->pins = 1 << ppage->order;
-	WARN_ON(insert_ppage(kvm, ppage));
+	/**
+	 * 填充kvm_pinned_page结构 ppage 记录锁定信息
+	 * 包括页面指针、IPA、页面阶数和引用计数
+	 * 然后将该结构插入到pKVM的maple tree中进行管理
+	 * 注意这里的引用计数初始化为 1 << order，也就是页面的阶数
+	 */
+	ppage->page = page; // 锁定的物理页面
+	ppage->ipa = *fault_ipa; // 对应的IPA地址
+	ppage->order = get_order(page_size); // 页面阶数（0=4KB, 9=2MB）
+	ppage->pins = 1 << ppage->order; // 实际锁定的页面数量
+	WARN_ON(insert_ppage(kvm, ppage)); // 插入maple tree管理
 
 	write_unlock(&kvm->mmu_lock);
 
@@ -2098,29 +2233,59 @@ static void handle_access_fault(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
  * space. The distinction is based on the IPA causing the fault and whether this
  * memory region has been registered as standard RAM by user space.
  */
+/**
+ * 该函数主要处理的是来自 Guest 虚拟机的二级页表访问异常
+ * 这些异常通常是由于缺少二级页表项引起的
+ * 该函数会根据异常的类型和地址来决定是分配内存页，还是将异常传递给用户空间进行处理
+ * 可能需要进行内存分配与 I/O 内存访问的区分
+ */
 int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 {
-	unsigned long fault_status;
-	phys_addr_t fault_ipa;
-	struct kvm_memory_slot *memslot;
-	unsigned long hva;
-	bool is_iabt, write_fault, writable;
-	gfn_t gfn;
-	int ret, idx;
+	unsigned long fault_status; // 需要处理的异常对应的异常状态码
+	phys_addr_t fault_ipa; // 发生异常的 IPA 地址
+	struct kvm_memory_slot *memslot; // 发生异常的内存槽指针
+	unsigned long hva; // 发生异常的 HVA 地址， HVA 地址是 Host 虚拟地址
+	bool is_iabt, write_fault, writable; // 标志位，分别代表指令异常，写异常和可写权限
+	gfn_t gfn; // 发生异常的 GFN 地址，也就是 Guest 物理页号（帧号）
+	int ret, idx; // 返回值和索引
 
+	/**
+	 * 获取异常的相关信息
+	 * 通过读取 vCPU 结构体中存储的 ESR_EL2 寄存器数值中的
+	 * FSC 字段来确定异常的具体类型
+	 */
 	fault_status = kvm_vcpu_trap_get_fault_type(vcpu);
 
+	/**
+	 * 获取发生异常的 IPA 地址
+	 * 以及判断异常是否为指令异常
+	 * IPA 地址来源于 vCPU 结构体中存储的 HFAR_EL2 寄存器
+	 * 指令异常则通过 vCPU 结构体中存储的 ESR_EL2 寄存器中的 EC 字段来判断
+	 */
 	fault_ipa = kvm_vcpu_get_fault_ipa(vcpu);
 	is_iabt = kvm_vcpu_trap_is_iabt(vcpu);
 
+	/**
+	 * 如果异常类型为地址转换异常，也就是 Stage-2 页表中没有对应的页表项
+	 * 则需要进一步检查异常的 IPA 地址是否在允许的范围内
+	 */
 	if (fault_status == ESR_ELx_FSC_FAULT) {
-		/* Beyond sanitised PARange (which is the IPA limit) */
+		/**
+		 * 检查 IPA 地址是否超出允许的范围，该范围是由
+		 * KVM 配置的 IPA 限制决定的
+		 * 如果超出范围，则注入地址大小异常到 Guest
+		 */
 		if (fault_ipa >= BIT_ULL(get_kvm_ipa_limit())) {
 			kvm_inject_size_fault(vcpu);
 			return 1;
 		}
 
-		/* Falls between the IPA range and the PARange? */
+		/**
+		 * 针对非 pKVM 场景，如果 IPA 地址超出了
+		 * 当前 vCPU 所配置的物理地址空间大小，且
+		 * 处于 IPA 地址长度与物理地址空间大小之间的范围内
+		 * 则同样注入指令/数据地址大小异常到 Guest
+		 */
 		if (!is_protected_kvm_enabled() &&
 		    fault_ipa >= BIT_ULL(vcpu->arch.hw_mmu->pgt->ia_bits)) {
 			fault_ipa |= kvm_vcpu_get_hfar(vcpu) & GENMASK(11, 0);
@@ -2133,7 +2298,12 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 		}
 	}
 
-	/* Synchronous External Abort? */
+	/**
+	 * 检查是否为 SEA 异常，也就是同步外部异常
+	 * 这种异常通常是由硬件错误引起的
+	 * 如果是 SEA 异常，则调用 kvm_handle_guest_sea() 进行处理
+	 * 如果处理失败，则将异常注入到 Guest
+	 */
 	if (kvm_vcpu_abt_issea(vcpu)) {
 		/*
 		 * For RAS the host kernel may handle this abort.
@@ -2144,11 +2314,15 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 
 		return 1;
 	}
-
+	// 使用 trace 追踪记录异常信息
 	trace_kvm_guest_fault(*vcpu_pc(vcpu), kvm_vcpu_get_esr(vcpu),
 			      kvm_vcpu_get_hfar(vcpu), fault_ipa);
 
-	/* Check the stage-2 fault is trans. fault or write fault */
+	/**
+	 * 检查目前的异常类型是否为支持的类型
+	 * 目前仅支持地址转换异常、权限异常和访问标志异常
+	 * 如果异常类型不支持，则记录错误日志并返回错误码
+	 */
 	if (fault_status != ESR_ELx_FSC_FAULT &&
 	    fault_status != ESR_ELx_FSC_PERM &&
 	    fault_status != ESR_ELx_FSC_ACCESS) {
@@ -2159,39 +2333,45 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 		return -EFAULT;
 	}
 
+	// 获取 SRCU 索引以保护对 KVM 结构体的访问，主要是防止内存槽被修改
+	// 该索引用于后续的解锁操作
 	idx = srcu_read_lock(&vcpu->kvm->srcu);
 
+	// 根据触发异常的 IPA 地址获取 Guest 页号
 	gfn = fault_ipa >> PAGE_SHIFT;
+	// 使用 GFN 获取对应的内存槽和 HVA 地址
+	// 同时检查该 HVA 地址是否具有写权限
+	// 如果 HVA 地址无效或者写异常但没有写权限，则需要进一步处理
 	memslot = gfn_to_memslot(vcpu->kvm, gfn);
 	hva = gfn_to_hva_memslot_prot(memslot, gfn, &writable);
 	write_fault = kvm_is_write_fault(vcpu);
 	if (kvm_is_error_hva(hva) || (write_fault && !writable)) {
-		/*
-		 * The guest has put either its instructions or its page-tables
-		 * somewhere it shouldn't have. Userspace won't be able to do
-		 * anything about this (there's no syndrome for a start), so
-		 * re-inject the abort back into the guest.
+		/**
+		 * 如果是指令异常，则直接注入指令地址异常到 Guest
+		 * 因为指令异常通常是由于尝试执行不可执行的内存
+		 * 或者访问了未映射的内存地址引起的
 		 */
 		if (is_iabt) {
 			ret = -ENOEXEC;
 			goto out;
 		}
 
+		/**
+		 * 检查是否为 Stage 1 页表遍历过程中的异常，
+		 * 这种异常通常是由于访问了无效的内存地址引起的
+		 * 如果是这种异常，则注入数据地址异常到 Guest
+		 */
 		if (kvm_vcpu_abt_iss1tw(vcpu)) {
 			kvm_inject_dabt(vcpu, kvm_vcpu_get_hfar(vcpu));
 			ret = 1;
 			goto out_unlock;
 		}
 
-		/*
-		 * Check for a cache maintenance operation. Since we
-		 * ended-up here, we know it is outside of any memory
-		 * slot. But we can't find out if that is for a device,
-		 * or if the guest is just being stupid. The only thing
-		 * we know for sure is that this range cannot be cached.
-		 *
-		 * So let's assume that the guest is just being
-		 * cautious, and skip the instruction.
+		/**
+		 * 针对可能的缓存维护指令导致对于无效地址的访问，
+		 * 这种情况下直接跳过触发异常的当前指令并继续执行
+		 * 因为此处假设客户机是进行了缓存维护操作
+		 * 而不是试图访问实际的内存地址
 		 */
 		if (kvm_is_error_hva(hva) && kvm_vcpu_dabt_is_cm(vcpu)) {
 			kvm_incr_pc(vcpu);
@@ -2199,26 +2379,31 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 			goto out_unlock;
 		}
 
-		/*
-		 * The IPA is reported as [MAX:12], so we need to
-		 * complement it with the bottom 12 bits from the
-		 * faulting VA. This is always 12 bits, irrespective
-		 * of the page size.
+		/**
+		 * 如果异常的 IPA 地址不在任何已注册的内存槽范围内
+		 * 则将异常视为对 I/O 映射内存的访问
+		 * 重构完整的 IPA 地址后调用 io_mem_abort() 进行处理
+		 * 该函数会将异常传递给用户空间进行处理
 		 */
 		fault_ipa |= kvm_vcpu_get_hfar(vcpu) & FAR_MASK;
 		ret = io_mem_abort(vcpu, fault_ipa);
 		goto out_unlock;
 	}
 
-	/* Userspace should not be able to register out-of-bounds IPAs */
+	// 在进行内存访问处理前，检查 IPA 地址是否仍在允许的范围内，
+	// 用户空间不应该注册超出 IPA 限制的内存槽
 	VM_BUG_ON(fault_ipa >= kvm_phys_size(vcpu->kvm));
 
+	// 如果异常类型为访问标志异常，则调用 handle_access_fault() 进行处理
 	if (fault_status == ESR_ELx_FSC_ACCESS) {
 		handle_access_fault(vcpu, fault_ipa);
 		ret = 1;
 		goto out_unlock;
 	}
 
+	// 根据当前是否启用了 pKVM，调用不同的函数进行内存访问处理
+	// 此处是真的为了处理缺失的 Stage-2 页表项
+	// 可能涉及到内存分配或者权限更新等操作
 	if (is_protected_kvm_enabled() && fault_status != ESR_ELx_FSC_PERM)
 		ret = pkvm_mem_abort(vcpu, &fault_ipa, memslot, hva, NULL);
 	else
@@ -2227,11 +2412,16 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 	if (ret == 0)
 		ret = 1;
 out:
+	/**
+	 * 如果内存访问处理失败，并且异常类型为权限异常，则注入权限异常到 Guest
+	 * 这种情况通常是由于用户空间未正确设置内存权限引起的
+	 */
 	if (ret == -ENOEXEC) {
 		kvm_inject_pabt(vcpu, kvm_vcpu_get_hfar(vcpu));
 		ret = 1;
 	}
 out_unlock:
+	// 释放之前获得的 SRCU 索引
 	srcu_read_unlock(&vcpu->kvm->srcu, idx);
 	return ret;
 }

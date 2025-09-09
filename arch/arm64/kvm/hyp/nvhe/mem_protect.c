@@ -2733,13 +2733,27 @@ unlock:
 
 }
 
+/**
+ * 将 host page 捐赠给 guest，从 pfn 起始，捐赠 nr_pages 页，到 gfn 起始的 guest page
+ * @vcpu: 发起捐赠的 vcpu
+ * @pfn: host page 的 pfn
+ * @gfn: guest page 的 gfn
+ * @nr_pages: 捐赠的页数
+ * 返回 0 表示成功, 负值表示失败
+ */
 int __pkvm_host_donate_guest(struct pkvm_hyp_vcpu *vcpu, u64 pfn, u64 gfn,
 			     u64 nr_pages)
 {
 	int ret;
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 guest_addr = hyp_pfn_to_phys(gfn);
+	u64 host_addr = hyp_pfn_to_phys(pfn); // 将 Host 的 pfn 转为物理地址
+	u64 guest_addr = hyp_pfn_to_phys(gfn); // 将 Guest 的 gfn 转为物理地址
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	/**
+	 * 初始化捐赠过程的指导结构体，其中包括的信息有：
+	 *  - 捐赠的页数
+	 *  - 发起者的信息（ID、物理地址、补全者的地址）
+	 *  - 补全者的信息（ID、Guest VM、指定的 memcache、物理地址）
+	 */
 	struct pkvm_mem_transition donation = {
 		.nr_pages	= nr_pages,
 		.initiator	= {
@@ -2762,6 +2776,7 @@ int __pkvm_host_donate_guest(struct pkvm_hyp_vcpu *vcpu, u64 pfn, u64 gfn,
 	host_lock_component();
 	guest_lock_component(vm);
 
+	// 调用 do_donate() 函数执行捐赠操作
 	ret = do_donate(&donation);
 
 	guest_unlock_component(vm);
