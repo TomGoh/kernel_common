@@ -286,6 +286,10 @@ static inline void ___deactivate_traps(struct kvm_vcpu *vcpu)
 	}
 }
 
+/*
+ * 调用 __get_fault_info 获取详细的故障信息，将故障信息存储在 vCPU 的 fault 结构中
+ * 返回布尔变量，true 代表收集成功， false 代表收集失败
+ */
 static inline bool __populate_fault_info(struct kvm_vcpu *vcpu)
 {
 	return __get_fault_info(vcpu->arch.fault.esr_el2, &vcpu->arch.fault);
@@ -575,8 +579,33 @@ static bool kvm_hyp_handle_cp15_32(struct kvm_vcpu *vcpu, u64 *exit_code)
 	return false;
 }
 
+/*
+ * 处理低异常级别的数据访问异常中内存故障情况的函数
+ * 首先试图填充故障的具体信息
+ * 如果 Hypervisor 无法填充故障信息，则意味着需要返回 Guest，返回 true 进而继续在
+ * `_kvm_vcpu_run` 的 do{} while() 循环中运行 Guest pVM；
+ * 如果 Hypervisor 成功填充故障信息，则 Hypervisor 在该函数调用的
+ * `kvm_hyp_handle_dabt_low` 函数中继续处理，返回 false
+*/
 static bool kvm_hyp_handle_memory_fault(struct kvm_vcpu *vcpu, u64 *exit_code)
-{
+{	
+	// 如果信息收集失败，意味着 Hypervisor 无法进行错误处理，返回 Guest
+	/* 
+	 * 常见的可能导致翻译失败的原因是： 
+	 * 页表变化产生争用，导致翻译的指令 AT 失败：
+	 * 	1. Hypervisor开始处理，读取FAR_EL2获得故障地址，而同时，
+	 * 		Guest或Host的其他CPU核心正在修改页表
+	 *  2. 瞬态地址：Guest访问的地址在Stage 1翻译时是有效的，
+	 * 		但当Hypervisor尝试重新翻译时，该映射已经不存在，
+	 * 		可能是Guest OS刚好在处理页面换出、内存回收等操作
+	 *  3. 地址范围超出限制
+	 * 		 Guest提供了超出其地址空间范围的地址，AT指令无法完成翻译
+	 * 	由于返回 Guest 前并没有步进其 PC 寄存器，Guest 在返回执行后会继续执行统一指令。
+	 *  由于上述的原因很大程度都是不稳定的页表状态，因此 Guest 再次执行时页表状态可能已经稳定
+	 *  如果是合法的地址的访问则有很大概率被成功执行，
+	 *  如果确实是非法访问，会再次触发异常，这次可以正确收集虚拟地址和物理地址从而正确地被 Hypervisor 处理
+	 */
+
 	if (!__populate_fault_info(vcpu))
 		return true;
 
@@ -587,11 +616,21 @@ static bool kvm_hyp_handle_iabt_low(struct kvm_vcpu *vcpu, u64 *exit_code)
 static bool kvm_hyp_handle_watchpt_low(struct kvm_vcpu *vcpu, u64 *exit_code)
 	__alias(kvm_hyp_handle_memory_fault);
 
+/*
+ * 处理来自低异常级别的数据访问异常
+ * 首先使用 `kvm_hyp_handle_memory_fault` 试图处理内存故障
+ * 而后使检查是否为 vGIC v2 的 CPU 接口访问陷阱，如果是则进行对应处理
+ */
 static bool kvm_hyp_handle_dabt_low(struct kvm_vcpu *vcpu, u64 *exit_code)
-{
+{	
+	// 检测是否是内存故障并试图收集数据（包括触发的虚拟地址和物理地址）
+	// 若信息收集失败（kvm_hyp_handle_memory_fault 返回 true），则返回 true 再次进入 Guest
+	// 信息收集成功则继续该函数的执行
 	if (kvm_hyp_handle_memory_fault(vcpu, exit_code))
 		return true;
 
+	// 如果 vgic_v2_cpuif_trap 分支被启用（在 vgic_v2_probe 中被启用）
+	// 则遇到一个 vgic_v2 异常，进行相应的处理
 	if (static_branch_unlikely(&vgic_v2_cpuif_trap)) {
 		bool valid;
 
@@ -612,6 +651,8 @@ static bool kvm_hyp_handle_dabt_low(struct kvm_vcpu *vcpu, u64 *exit_code)
 		}
 	}
 
+	// 对于非 vgic_v2 异常且成功收集了触发数据异常的虚拟地址和物理地址的异常
+	// 返回 false 交由 Host 处理，先不会再次回到 Guest 运行
 	return false;
 }
 

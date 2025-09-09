@@ -307,25 +307,25 @@ extern u64 __kvm_get_mdcr_el2(void);
 	"	.popsection\n"
 
 
-#define __kvm_at(at_op, addr)						\
-( { 									\
-	int __kvm_at_err = 0;						\
-	u64 spsr, elr;							\
-	asm volatile(							\
-	"	mrs	%1, spsr_el2\n"					\
-	"	mrs	%2, elr_el2\n"					\
-	"1:	at	"at_op", %3\n"					\
-	"	isb\n"							\
-	"	b	9f\n"						\
-	"2:	msr	spsr_el2, %1\n"					\
-	"	msr	elr_el2, %2\n"					\
-	"	mov	%w0, %4\n"					\
-	"9:\n"								\
-	__KVM_EXTABLE(1b, 2b)						\
-	: "+r" (__kvm_at_err), "=&r" (spsr), "=&r" (elr)		\
-	: "r" (addr), "i" (-EFAULT));					\
-	__kvm_at_err;							\
-} )
+#define __kvm_at(at_op, addr) \
+({ \
+	int __kvm_at_err = 0; \
+	u64 spsr, elr; \
+	asm volatile( \
+	"   mrs %1, spsr_el2\n"     /* 保存异常程序状态寄存器 */ \
+	"   mrs %2, elr_el2\n"      /* 保存异常链接寄存器 */ \
+	"1: at  "at_op", %3\n"     /* 执行地址翻译指令 AT，将虚拟地址翻译为物理地址 */ \
+	"   isb\n"                  /* 指令同步屏障 */ \
+	"   b   9f\n"               /* 跳转到结束 */ \
+	"2: msr spsr_el2, %1\n"     /* 异常时恢复状态 */ \
+	"   msr elr_el2, %2\n"      /* 异常时恢复链接 */ \
+	"   mov %w0, %4\n"          /* 设置错误码 */ \
+	"9:\n" \
+	__KVM_EXTABLE(1b, 2b)       /* 异常处理表条目 */ \
+	: "+r" (__kvm_at_err), "=&r" (spsr), "=&r" (elr) \
+	: "r" (addr), "i" (-EFAULT)); \
+	__kvm_at_err; \
+})
 
 void __noreturn hyp_panic(void);
 asmlinkage void kvm_unexpected_el2_exception(void);
